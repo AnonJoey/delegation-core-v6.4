@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""
+session_export.py — Claude Code SessionEnd hook.
+
+Fires automatically when a Claude Code session closes.
+Reads the session transcript JSONL, formats it as markdown,
+and writes it to the vault's sessions/ folder.
+
+This is a raw-transcript backup. It is NOT a replacement for
+export_session() (the MCP tool Claude calls to write a curated summary).
+Both files are useful: this one is the full record, the MCP tool is the digest.
+
+Requires only stdlib — runs with system Python 3.11+, no venv needed.
+
+Hook registration (add to ~/.claude/settings.json):
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [{ "type": "command", "command": "python3 /path/to/hooks/session_export.py" }]
+      }
+    ]
+  }
+}
+"""
+
+import json
+import platform
+import subprocess
+import sys
+import os
+from datetime import datetime
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".delegation_core" / "config.json"
+MAX_TEXT_LENGTH = 8000  # truncate very long individual messages
+
+_VENV_DIR = Path.home() / ".delegation_core" / "venv"
+VENV_BIN = (
+    _VENV_DIR / "Scripts" / "delegation-core.exe"
+    if platform.system() == "Windows"
+    else _VENV_DIR / "bin" / "delegation-core"
+)
+REINDEX_LOG = Path.home() / ".delegation_core" / "reindex.log"
+
+
+def _detached_popen_kwargs() -> dict:
+    """Platform-appropriate kwargs to fully detach a background process.
+
+    POSIX: ``start_new_session`` (setsid) so the child survives the parent's
+    exit. Windows: ``start_new_session`` is silently ignored by subprocess
+    on that platform, so use DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP
+    instead, which achieve the equivalent (no console, own process group).
+    """
+    if platform.system() == "Windows":
+        return {
+            "creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        }
+    return {"start_new_session": True}
+
+
+def _load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _trigger_reindex() -> bool:
+    """Fire `delegation-core reindex` as a detached background process so the
+    transcript just written becomes searchable without a manual reindex.
+
+    Best-effort: returns False if the venv binary isn't installed yet.
+    """
+    if not VENV_BIN.exists():
+        return False
+    try:
+        with open(REINDEX_LOG, "a", encoding="utf-8") as log_fh:
+            subprocess.Popen(
+                [str(VENV_BIN), "reindex"],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                **_detached_popen_kwargs(),
+            )
+        return True
+    except Exception:
+        return False
+
+
+def _parse_transcript(transcript_path: str) -> list[dict]:
+    """Extract user and assistant text turns from the JSONL transcript."""
+    messages = []
+    try:
+        with open(transcript_path, encoding="utf-8") as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    obj = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = obj.get("type")
+                if msg_type not in ("user", "assistant"):
+                    continue
+
+                message = obj.get("message", {})
+                role = message.get("role", msg_type)
+                content = message.get("content", "")
+                ts = obj.get("timestamp", "")
+
+                if isinstance(content, str):
+                    text = content.strip()
+                elif isinstance(content, list):
+                    # Keep only text blocks; skip thinking, tool_use, tool_result
+                    parts = [
+                        c.get("text", "")
+                        for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    ]
+                    text = "\n".join(parts).strip()
+                else:
+                    continue
+
+                if not text:
+                    continue
+
+                if len(text) > MAX_TEXT_LENGTH:
+                    text = text[:MAX_TEXT_LENGTH] + "\n\n*[truncated — full text in source transcript]*"
+
+                messages.append({"role": role, "text": text, "ts": ts})
+
+    except Exception as e:
+        sys.stderr.write(f"session_export: failed to read transcript: {e}\n")
+
+    return messages
+
+
+def _format_markdown(messages: list[dict], session_id: str, cwd: str) -> str:
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    time_str = datetime.now().strftime("%H:%M")
+    short_id = session_id[:8]
+
+    # Build a rough title from the first user message
+    first_user = next((m for m in messages if m["role"] == "user"), None)
+    topic = first_user["text"][:80].split("\n")[0].strip() if first_user else "Session"
+    topic = topic[:60]
+
+    lines = [
+        "---",
+        f"title: Raw transcript — {topic}",
+        f"date: {date_str}",
+        f"session_id: {session_id}",
+        f"cwd: {cwd}",
+        f"messages: {len(messages)}",
+        "type: session-transcript",
+        "---",
+        "",
+        f"# Session transcript — {short_id}",
+        f"*Exported automatically at {date_str} {time_str}*  ",
+        f"*Working directory: `{cwd}`*",
+        "",
+        "> This is a verbatim raw transcript. For the curated summary, see the",
+        "> `export_session` note written by Claude before ending the session.",
+        "",
+        "---",
+        "",
+    ]
+
+    for msg in messages:
+        role_label = "### You" if msg["role"] == "user" else "### Claude"
+        ts_label = f" *({msg['ts'][:16].replace('T', ' ')})*" if msg["ts"] else ""
+        lines.append(f"{role_label}{ts_label}")
+        lines.append("")
+        lines.append(msg["text"])
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def main():
+    raw = sys.stdin.read().strip()
+    if not raw:
+        sys.exit(0)
+
+    try:
+        hook_data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"session_export: bad hook JSON: {e}\n")
+        sys.exit(0)
+
+    transcript_path = hook_data.get("transcript_path", "")
+    session_id = hook_data.get("session_id", "unknown")
+    cwd = hook_data.get("cwd", "")
+
+    if not transcript_path or not Path(transcript_path).exists():
+        sys.stderr.write(f"session_export: no transcript at '{transcript_path}'\n")
+        sys.exit(0)
+
+    config = _load_config()
+    vault_path = config.get("vault_path", "")
+    if not vault_path:
+        sys.stderr.write("session_export: delegation-core not configured — skipping export\n")
+        sys.exit(0)
+
+    vault = Path(vault_path).expanduser()
+    sessions_dir = vault / "sessions"
+
+    try:
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        sys.stderr.write(f"session_export: could not create sessions/ dir: {e}\n")
+        sys.exit(0)
+
+    messages = _parse_transcript(transcript_path)
+    if not messages:
+        sys.stderr.write("session_export: no messages found in transcript — skipping\n")
+        sys.exit(0)
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    short_id = session_id[:8]
+    filename = f"{date_str}-transcript-{short_id}.md"
+    dest = sessions_dir / filename
+
+    # Don't overwrite if a file for this session already exists
+    if dest.exists():
+        sys.stderr.write(f"session_export: {filename} already exists — skipping\n")
+        sys.exit(0)
+
+    content = _format_markdown(messages, session_id, cwd)
+    try:
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, dest)
+        sys.stderr.write(
+            f"session_export: saved {len(messages)} messages ({len(content)} chars) → {dest}\n"
+        )
+    except Exception as e:
+        sys.stderr.write(f"session_export: write failed: {e}\n")
+        sys.exit(0)
+
+    if _trigger_reindex():
+        sys.stderr.write("session_export: triggered background reindex\n")
+
+
+if __name__ == "__main__":
+    main()
