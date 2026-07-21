@@ -152,5 +152,19 @@ Verify the reload succeeded by checking `heartbeat` now reports `engine_mode`.
 
 ---
 
+## JOEY deployment — v6.4 GitHub repository release — 2026-07-21
+
+**Action.** Initialized Git workflow and deployed `delegation_core_v6.4` to a dedicated public GitHub repository.
+
+**Details.**
+- **Local Repository:** `/home/joey/Projects/delegation_core_v6.4`
+- **Git User Configured:** `joey bernardes <followthepillow@gmail.com>`
+- **GitHub Repository Created:** [https://github.com/AnonJoey/delegation-core-v6.4](https://github.com/AnonJoey/delegation-core-v6.4)
+- **Tooling Used:** GitHub CLI (`gh` v2.96.0) installed and authenticated to `AnonJoey`.
+- **Status:** Initial `v6.4` release commit pushed to `origin/master`.
+
+---
+
 <!-- Next deployment: append your entry above this line, newest first under its own
      "## <NAME> deployment — <action> — <date>" header. -->
+
